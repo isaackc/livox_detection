@@ -5,7 +5,7 @@ import copy
 import config.config as cfg
 from networks.model import *
 import lib_cpp
-
+import math
 import time
 
 import rospy
@@ -192,7 +192,16 @@ class Detector(object):
                 continue
             if np.abs(point[0]) < 2.0 and np.abs(point[1]) < 1.5:
                 continue
-            points_list.append(point)
+
+            #45 degrees slant
+            x = point[0]*math.cos(math.radians(47))+point[2]*math.sin(math.radians(47))
+            y = point[1]
+            z = point[2]*math.cos(math.radians(47))-point[0]*math.sin(math.radians(47)) + 5.5
+            new_pt = (x, y, z, point[3])
+            points_list.append(new_pt)
+
+            #original
+            #points_list.append(point)
         points_list = np.asarray(points_list)
         pointcloud_msg = pcl2.create_cloud_xyz32(header, points_list[:, 0:3])
         vox = self.data2voxel(points_list)
