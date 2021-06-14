@@ -1,3 +1,4 @@
+import atexit
 import os
 import numpy as np
 import tensorflow as tf
@@ -6,6 +7,7 @@ import config.config as cfg
 from networks.model import *
 import lib_cpp
 import math
+import sys
 import time
 
 import rospy
@@ -18,6 +20,22 @@ import sensor_msgs.point_cloud2 as pcl2
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
+import csv
+from datetime import datetime
+
+#check for input
+lidar_height = 0
+HEIGHT_CORRECTION = -1.5
+n = len(sys.argv)
+try:
+    lidar_height = float(sys.argv[1]) + HEIGHT_CORRECTION
+    folder_num = int(sys.argv[2])
+except:
+    print("Not enough args")
+    sys.exit()
+
+#multimem shit
+#a = np.array([0])
 mnum = 0
 marker_array = MarkerArray()
 marker_array_text = MarkerArray()
@@ -55,6 +73,12 @@ lines = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6],
 
 class Detector(object):
     def __init__(self, *, nms_threshold=0.1, weight_file=None):
+        self.folder_name = 'Flight_Logs'
+        self.folder_num = folder_num
+        self.edge_file = None
+        self.csv_writer = None
+        self.init_file()    
+        
         self.net = livox_model(HEIGHT, WIDTH, CHANNELS)
         with tf.Graph().as_default():
             with tf.device('/gpu:'+str(cfg.GPU_INDEX)):
@@ -72,9 +96,11 @@ class Detector(object):
                 self.ops = {'input_bev_img_pl': input_bev_img_pl,  # input
                             'end_points': end_points,  # output
                             }
+        self.ped_count = 0
         rospy.init_node('livox_test', anonymous=True)
+        #/livox/odin_frame /livox/lidar
         self.sub = rospy.Subscriber(
-            "/livox/lidar", PointCloud2, queue_size=10, callback=self.LivoxCallback)
+            "/livox/odin_frame", PointCloud2, queue_size=1, buff_size=2**24, callback=self.LivoxCallback)
         self.marker_pub = rospy.Publisher(
             '/detect_box3d', MarkerArray, queue_size=10)
         self.marker_text_pub = rospy.Publisher(
@@ -82,6 +108,29 @@ class Detector(object):
         self.pointcloud_pub = rospy.Publisher(
             '/pointcloud', PointCloud2, queue_size=10)
 
+    def init_file(self):
+        path = os.getcwd()
+        path = path + '/' + self.folder_name
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        path = path + '/' + 'Flight_Logs' + str(self.folder_num)
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        file_name = datetime.now().strftime("%m_%d_%Y_%H-%M-%S") + '_edge_log.csv'
+        self.edge_file = open(path + '/' + file_name, "a+")
+        self.csv_writer = csv.writer(self.edge_file)
+        self.csv_writer.writerow(['seq', 'det_time', 'ped_count', 'num_detections', 'detections'])
+
+    def register_exit_function(self):
+        atexit.register(self.close_file_and_exit)
+
+    def close_file_and_exit(self):
+        print("closing file")
+        self.edge_file.close()
+        sys.exit()
+        
     def roty(self, t):
         c = np.cos(t)
         s = np.sin(t)
@@ -153,8 +202,9 @@ class Detector(object):
         reg_theta_list = result[:, 2].tolist()
         reg_m_z_list = result[:, 8].tolist()
         reg_h_list = result[:, 7].tolist()
-
+        
         results = []
+        self.ped_count = 0
         for i in range(len(is_obj_list)):
             box3d_pts_3d = np.ones((8, 4), float)
             box3d_pts_3d[:, 0:3] = self.get_3d_box( \
@@ -169,6 +219,7 @@ class Detector(object):
                 cls_name = "truck"
             elif int(obj_cls_list[i]) == 3:
                 cls_name = "pedestrian"
+                self.ped_count += 1
             else:
                 cls_name = "bimo"
             results.append([cls_name,
@@ -183,10 +234,12 @@ class Detector(object):
 
     def LivoxCallback(self, msg):
         global mnum
+        t0 = time.time()
         header = std_msgs.msg.Header()
         header.stamp = rospy.Time.now()
         header.frame_id = 'livox_frame'
         points_list = []
+        t2 = time.time()
         for point in pcl2.read_points(msg, skip_nans=True, field_names=("x", "y", "z", "intensity")):
             if point[0] == 0 and point[1] == 0 and point[2] == 0:
                 continue
@@ -194,22 +247,30 @@ class Detector(object):
                 continue
 
             #45 degrees slant
-            x = point[0]*math.cos(math.radians(47))+point[2]*math.sin(math.radians(47))
+            x = point[0]*math.cos(math.radians(45))+point[2]*math.sin(math.radians(45))
             y = point[1]
-            z = point[2]*math.cos(math.radians(47))-point[0]*math.sin(math.radians(47)) + 5.5
+            z = point[2]*math.cos(math.radians(45))-point[0]*math.sin(math.radians(45)) + lidar_height # + (height - 1.5)
+            #formula is height - 1.5, since ground level is at -1.9m and you subtract -0.4m sxince LiDAR is a little bit below the actual height.
             new_pt = (x, y, z, point[3])
             points_list.append(new_pt)
 
+
+            #code below is for vertical
+            # new_pt = (point[0], point[1], point[2]-1.9, point[3])
+            # points_list.append(new_pt)
+            
             #original
             #points_list.append(point)
+        t3 = time.time()
+        print('proc_time(ms)', 1000*(t3-t2))
         points_list = np.asarray(points_list)
         pointcloud_msg = pcl2.create_cloud_xyz32(header, points_list[:, 0:3])
         vox = self.data2voxel(points_list)
         vox = np.expand_dims(vox, axis=0)
-        t0 = time.time()
+        
         result = self.detect(vox)
-        t1 = time.time()
-        print('det_time(ms)', 1000*(t1-t0))
+        
+        
         print('det_numbers', len(result))
         for ii in range(len(result)):
             result[ii][1:9] = list(np.array(result[ii][1:9]))
@@ -218,6 +279,8 @@ class Detector(object):
         boxes = result
         marker_array.markers.clear()
         marker_array_text.markers.clear()
+
+        csv_marker_array = []
         for obid in range(len(boxes)):
             ob = boxes[obid]
             tid = 0
@@ -273,6 +336,7 @@ class Detector(object):
             marker1.pose.position.z = (ob[21]+ob[23])/2+1
 
             marker1.text = ob[0]+':'+str(np.floor(ob[25]*100)/100)
+            csv_marker_array.append(marker1.text)
 
             marker_array_text.markers.append(marker1)
         if mnum > len(boxes):
@@ -310,8 +374,14 @@ class Detector(object):
         self.marker_pub.publish(marker_array)
         self.pointcloud_pub.publish(pointcloud_msg)
         self.marker_text_pub.publish(marker_array_text)
-
-
+        t1 = time.time()
+        #print('det_time(ms)', 1000*(t1-t0))
+        self.csv_writer.writerow([msg.header.seq,
+                                  1000*(t1-t0),
+                                  self.ped_count,
+                                  mnum, (str(csv_marker_array)).strip('"')])
+        self.ped_count = 0
 if __name__ == '__main__':
     livox = Detector()
+    livox.register_exit_function()
     rospy.spin()
