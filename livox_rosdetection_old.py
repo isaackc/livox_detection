@@ -1,6 +1,4 @@
 import atexit
-import csv
-import pickle
 import os
 import numpy as np
 import tensorflow as tf
@@ -9,15 +7,11 @@ import config.config as cfg
 from networks.model import *
 import lib_cpp
 import math
-import socket
 import sys
 import time
-import traceback
 
 import rospy
 import std_msgs.msg
-
-from datetime import datetime
 from geometry_msgs.msg import Point
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import Point32
@@ -26,19 +20,20 @@ import sensor_msgs.point_cloud2 as pcl2
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
-DEBUG=1
+import csv
+from datetime import datetime
 
 #check for input
+lidar_height = 0
 HEIGHT_CORRECTION = -1.5
 n = len(sys.argv)
 try:
-    folder_num = int(sys.argv[1])
+    lidar_height = float(sys.argv[1]) + HEIGHT_CORRECTION
+    
+    folder_num = int(sys.argv[2])
 except:
     print("Not enough args")
     sys.exit()
-    
-bINTER = b"@!?*"  
-bEND   = b"*?!@"
 
 #multimem shit
 #a = np.array([0])
@@ -76,18 +71,15 @@ T1 = np.array([[0.0, -1.0, 0.0, 0.0],
 lines = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6],
          [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]
 
-def debug(line):
-  if(DEBUG):
-    print(line)
 
 class Detector(object):
-    def __init__(self, *, nms_threshold=0.1, weight_file=None, port=1028):
+    def __init__(self, *, nms_threshold=0.1, weight_file=None):
         self.folder_name = 'Flight_Logs'
         self.folder_num = folder_num
         self.edge_file = None
         self.csv_writer = None
         self.init_file()    
-
+        
         self.net = livox_model(HEIGHT, WIDTH, CHANNELS)
         with tf.Graph().as_default():
             with tf.device('/gpu:'+str(cfg.GPU_INDEX)):
@@ -105,30 +97,19 @@ class Detector(object):
                 self.ops = {'input_bev_img_pl': input_bev_img_pl,  # input
                             'end_points': end_points,  # output
                             }
-
-        self.angle = 35
         self.ped_count = 0
+        self.angle = 35
         rospy.init_node('livox_test', anonymous=True)
-        
         #/livox/odin_frame /livox/lidar
-        # self.sub = rospy.Subscriber(
-        #     "/livox/odin_frame", PointCloud2, queue_size=1, buff_size=2**24, callback=self.LivoxCallback)
+        self.sub = rospy.Subscriber(
+            "/raw", PointCloud2, queue_size=2, buff_size=2**24, callback=self.LivoxCallback)
         self.marker_pub = rospy.Publisher(
             '/detect_box3d', MarkerArray, queue_size=10)
         self.marker_text_pub = rospy.Publisher(
             '/text_det', MarkerArray, queue_size=10)
         self.pointcloud_pub = rospy.Publisher(
             '/pointcloud', PointCloud2, queue_size=10)
-        self.raw_pub = rospy.Publisher(
-            '/raw', PointCloud2, queue_size=10)
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.port = port
-        self.sock.bind(('', self.port))
-        self.sock.listen(1)
-        debug("Listening for clients")
-        
     def init_file(self):
         path = os.getcwd()
         path = path + '/' + self.folder_name
@@ -142,7 +123,7 @@ class Detector(object):
         file_name = datetime.now().strftime("%m_%d_%Y_%H-%M-%S") + '_edge_log.csv'
         self.edge_file = open(path + '/' + file_name, "a+")
         self.csv_writer = csv.writer(self.edge_file)
-        self.csv_writer.writerow(['seq', 'det_time', 'ped_count', 'num_detections', 'detections', 'altitude'])
+        self.csv_writer.writerow(['seq', 'det_time', 'ped_count', 'num_detections', 'detections'])
 
     def register_exit_function(self):
         atexit.register(self.close_file_and_exit)
@@ -151,66 +132,7 @@ class Detector(object):
         print("closing file")
         self.edge_file.close()
         sys.exit()
-
-    def recv_end(self, socket) -> 'byte stream':
-        '''
-        Taken from https://code.activestate.com/recipes/408859/
-        '''
-        total_data = []
-        while True:
-            data = socket.recv(500000)
-            #print("len data: ", len(data))
-            if not data:
-                debug("No data")
-                sys.exit()
-            if bEND in data:
-                #debug("bEND found in data")
-                total_data.append(data[:data.find(bEND)])
-                break
-            total_data.append(data)
-            #debug("len of adding total_data array: " + str(len(total_data)))
-            if len(total_data) > 1:
-                #check if the data was split between last two "data packets"
-                last_pair = total_data[-2] + total_data[-1]
-                if bEND in last_pair:
-                    #debug("popping")
-                    total_data[-2] = last_pair[:last_pair.find(bEND)]
-                    total_data.pop()
-                    break
-        #debug("len of total_data array: " + str(len(total_data)))
-
-        # find frame data and altitude, return as tuple
-        message = b''.join(total_data)
-        print("message: ", len(message))
         
-        divider = message.find(bINTER)
-        frame = pickle.loads(message[:divider])
-        altitude = pickle.loads(message[divider+len(bINTER):])
-
-        return frame, altitude
-        #return b''.join(total_data)
-    
-    def main_func(self):
-        new_sock, addr = self.sock.accept()
-        debug("Established connection")
-
-        while True:
-            try:
-                frame, altitude = self.recv_end(new_sock)
-
-                self.raw_pub.publish(frame)
-                self.LivoxCallback(frame, altitude)
-
-                # Send the acknowledgement after detection is done
-                ack_data = pickle.dumps("ack")
-                new_sock.send(ack_data)
-
-            except Exception as e:
-                traceback.print_exc()
-                print(e)
-                self.edge_file.close()
-                sys.exit()
-
     def roty(self, t):
         c = np.cos(t)
         s = np.sin(t)
@@ -312,7 +234,7 @@ class Detector(object):
                             is_obj_list[i]])
         return results
 
-    def LivoxCallback(self, msg, altitude):
+    def LivoxCallback(self, msg):
         global mnum
         t0 = time.time()
         header = std_msgs.msg.Header()
@@ -321,6 +243,25 @@ class Detector(object):
         points_list = []
         t2 = time.time()
         for point in pcl2.read_points(msg, skip_nans=True, field_names=("x", "y", "z", "intensity")):
+            #45 degrees slant
+            # x = point[0]*math.cos(math.radians(self.angle))+point[2]*math.sin(math.radians(self.angle))
+            # y = point[1]
+            # z = point[2]*math.cos(math.radians(self.angle))-point[0]*math.sin(math.radians(self.angle)) + 2.35 #7 - 1.9 - 0.358775
+            # # 2.7 was for 35 degre
+            # #formula is height - 1.5, since ground level is at -1.9m and you subtract -0.4m sxince LiDAR is a little bit below the actual height.
+            # new_pt = (x, y, z, point[3])
+
+            # if x == 0 and y == 0 and z == 0:
+            #     continue
+            # if np.abs(x) < 2.0 and np.abs(y) < 1.5:
+            #     continue
+            # points_list.append(new_pt)
+            #code below is for vertical
+            # new_pt = (point[0], point[1], point[2]-1.9, point[3])
+            # points_list.append(new_pt)
+            
+            #original
+            #points_list.append(point)
             if point[0] == 0 and point[1] == 0 and point[2] == 0:
                 continue
             if np.abs(point[0]) < 2.0 and np.abs(point[1]) < 1.5:
@@ -328,28 +269,7 @@ class Detector(object):
             #new_pt = (point[0], point[1], point[2]-altitude-0.358775, point[3])
             new_pt = (point[0], point[1], point[2]-1.9, point[3])
             points_list.append(new_pt)
-
-            # #45 degrees slant
-            # x = point[0]*math.cos(math.radians(self.angle))+point[2]*math.sin(math.radians(self.angle))
-            # y = point[1]
-            # z = point[2]*math.cos(math.radians(self.angle))-point[0]*math.sin(math.radians(self.angle)) + 2.4 #altitude - 1.9 - 0.358775 # height difference between LiDAR and gps
-            # #formula is height - 1.5, since ground level is at -1.9m and you subtract -0.4m sxince LiDAR is a little bit below the actual height.
-
-            # if x == 0 and y == 0 and z == 0:
-            #     continue
-            # if np.abs(x) < 2.0 and np.abs(y) < 1.5:
-            #     continue
-
-            # new_pt = (x, y, z, point[3])
-            # points_list.append(new_pt)
-
-
-            #code below is for vertical
-            # new_pt = (point[0], point[1], point[2]-1.9, point[3])
-            # points_list.append(new_pt)
             
-            #original
-            #points_list.append(point)
         t3 = time.time()
         print('proc_time(ms)', 1000*(t3-t2))
         points_list = np.asarray(points_list)
@@ -468,12 +388,9 @@ class Detector(object):
         self.csv_writer.writerow([msg.header.seq,
                                   1000*(t1-t0),
                                   self.ped_count,
-                                  mnum,
-                                  (str(csv_marker_array)).strip('"'),
-                                  altitude])
+                                  mnum, (str(csv_marker_array)).strip('"')])
         self.ped_count = 0
 if __name__ == '__main__':
     livox = Detector()
     livox.register_exit_function()
-    livox.main_func()
-    #rospy.spin()
+    rospy.spin()
